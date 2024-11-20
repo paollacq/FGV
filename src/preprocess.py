@@ -36,7 +36,6 @@ def preprocess_pipeline_chunked(input_file, output_file, chunk_size=10):  # Test
     header_written = False
     
     for i, chunk in enumerate(pd.read_csv(input_file, chunksize=chunk_size, header=None, names=['from_address', 'to_address', 'timestamp', 'value'])):
-        print(f"Processando chunk {i + 1}...")
         processed_chunk = process_chunk(chunk)
         
         # Salvar apenas o primeiro chunk para depuração
