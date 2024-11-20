@@ -2,7 +2,10 @@ import os
 import pandas as pd
 from src.preprocess import preprocess_pipeline_chunked
 from src.models import train_isolation_forest, detect_anomalies
-from src.visualization import plot_anomaly_score_distribution
+from src.visualization import plot_feature_distributions
+from src.models import evaluate_model
+from src.models import explain_model_with_shap
+
 
 # Caminhos
 RAW_FILE = "data/raw/btc_tx_2011_2013.csv"  # Arquivo bruto
@@ -22,32 +25,44 @@ preprocess_pipeline_chunked(
     chunk_size=100000
 )
 
-# 2. Treinamento do modelo de detecção de anomalias
+# 2. Carregar dados processados
 print("Carregando dados processados...")
 processed_data = pd.read_csv(PROCESSED_FILE)
 
-# Definir as colunas numéricas para treinamento
+# Verificar as estatísticas básicas
 numeric_columns = ['total_sent', 'total_received', 'net_flow']
+print("Estatísticas das features numéricas:")
+print(processed_data[numeric_columns].describe())
 
-print("Treinando modelo de detecção de anomalias...")
-model = train_isolation_forest(processed_data, numeric_columns=numeric_columns)
+# Configurações
+contamination_values = [0.001, 0.01, 0.05]
+features = ['total_sent', 'total_received', 'net_flow']
 
-# 3. Detecção de anomalias
-print("Detectando anomalias...")
-scores, predictions = detect_anomalies(model, processed_data[numeric_columns])
+for contamination in contamination_values:
+    print(f"\nTreinando Isolation Forest com contamination={contamination}...")
+    model, processed_data = train_isolation_forest(processed_data, features, contamination=contamination)
+    
+    # Salvar resultados intermediários para cada configuração
+    results_file = f"results/anomaly_scores_contamination_{contamination}.csv"
+    processed_data.to_csv(results_file, index=False)
+    print(f"Resultados salvos em {results_file}")
+    
+    # Analisar transações anômalas
+    anomalies = processed_data[processed_data['is_anomaly'] == 1]
+    print(f"Transações anômalas detectadas (contamination={contamination}): {len(anomalies)}")
+    print(anomalies[['total_sent', 'total_received', 'net_flow']].describe())
 
-# Adicionar os resultados ao DataFrame
-results = processed_data.copy()
-results["anomaly_score"] = scores
-results["is_anomaly"] = predictions
 
-# Salvar os resultados
-results.to_csv(ANOMALY_SCORES_FILE, index=False)
-print(f"Resultados salvos em {ANOMALY_SCORES_FILE}")
+# 5. Visualização
+# Plotar distribuições das features
+print("Gerando visualizações das distribuições das features...")
+plot_feature_distributions(processed_data, features, label_column='is_anomaly', save_path="results/visualizations")
 
-# 4. Gerar visualização dos scores de anomalias
-print("Gerando visualização dos scores de anomalia...")
-plot_anomaly_score_distribution(results, save_path=f"{VISUALIZATIONS_DIR}/anomaly_score_distribution.png")
-print(f"Visualização salva em {VISUALIZATIONS_DIR}/btc_anomaly_score_distribution.png")
+# Avaliar o modelo
+#print("Avaliando o modelo com métricas...")
+#evaluate_model(processed_data, true_labels_column='true_labels', anomaly_score_column='anomaly_score', prediction_column='is_anomaly')
+# Explicar o modelo com SHAP
+print("Explicando o modelo com SHAP...")
+explain_model_with_shap(model, processed_data, features)
 
 print("Pipeline concluído!")
