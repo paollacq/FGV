@@ -3,111 +3,147 @@
 import os
 import sys
 import pandas as pd
-import networkx as nx
+import numpy as np
 
 # Adicionar o diretório raiz ao sys.path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Importações existentes
+# Importações dos módulos personalizados
 from src.preprocess import preprocess_pipeline_chunked
-from src.models import train_isolation_forest
-from src.visualization import plot_feature_distributions
-from src.models import explain_model_with_shap
+from src.models import train_isolation_forest, train_random_forest, evaluate_model
+from src.visualization import (
+    plot_anomalous_transactions_per_month,
+    plot_anomalous_volume_per_month,
+    plot_transactions_per_address,
+    plot_heatmap_top_addresses,
+    plot_boxplot_transaction_values,
+    plot_total_sent_anomaly_scores,
+    plot_kde_anomaly_scores
+)
 
-# Importações para análise de grafos
-from graph_analysis.graph_modeling import build_graph_from_anomalous_transactions, extract_graph_features, visualize_graph
-
-# Caminhos
+# Caminhos dos arquivos
 RAW_FILE = "data/raw/btc_tx_2011_2013.csv"  # Arquivo bruto
 PROCESSED_FILE = "data/processed/btc_transactions_processed.csv"  # Arquivo processado
-ANOMALY_SCORES_FILE = "results/anomaly_scores.csv"  # Arquivo com scores de anomalia
-ANOMALOUS_TRANSACTIONS_FILE = "results/anomalous_transactions.csv"  # Arquivo com transações anômalas
 VISUALIZATIONS_DIR = "results/visualizations"  # Diretório para visualizações
 
 # Criar pastas necessárias
 os.makedirs("data/processed", exist_ok=True)
 os.makedirs("results/visualizations", exist_ok=True)
 
-# 1. Pré-processamento em chunks
-print("Executando pré-processamento em chunks...")
+# 1. Carregar os hashes de transações anômalas
+def load_anomaly_hashes():
+    # Carregar todos os arquivos de anomalias e retornar os hashes únicos de transações
+    anomalies_files = [
+        'data/database/anomalies_theft_tx.csv',
+        'data/database/anomalies_seizure1_tx.csv',
+        'data/database/anomalies_seizure2_tx.csv',
+        'data/database/anomalies_misc_tx.csv',
+        'data/database/anomalies_loss_tx.csv'
+    ]
+    anomaly_dataframes = []
+    for f in anomalies_files:
+        df = pd.read_csv(f, header=None, names=['tx_hash'])
+        anomaly_dataframes.append(df)
+    anomaly_hashes = pd.concat(anomaly_dataframes)['tx_hash'].unique()
+    return set(anomaly_hashes)
+
+print("Carregando hashes de transações anômalas...")
+anomaly_hashes = load_anomaly_hashes()
+print(f"Total de transações anômalas conhecidas: {len(anomaly_hashes)}")
+
+# 2. Pré-processamento em chunks com labels de anomalias
+print("Executando pré-processamento em chunks com labels de anomalias...")
 preprocess_pipeline_chunked(
     input_file=RAW_FILE,
     output_file=PROCESSED_FILE,
+    anomaly_hashes=anomaly_hashes,
     chunk_size=100000
 )
 
-# 2. Carregar dados processados
+# 3. Carregar dados processados
 print("Carregando dados processados...")
 transactions_df = pd.read_csv(PROCESSED_FILE)
 
-# Verificar as estatísticas básicas
-numeric_columns = ['total_sent', 'total_received', 'net_flow']
-print("Estatísticas das features numéricas:")
-print(transactions_df[numeric_columns].describe())
+# Verificar se transactions_df está vazio
+if transactions_df.empty:
+    print("O DataFrame transactions_df está vazio. Verifique o pré-processamento.")
+    sys.exit(1)
 
-# 3. Detecção de Anomalias com Isolation Forest
-print("\nExecutando detecção de anomalias com Isolation Forest...")
-features = ['total_sent', 'total_received', 'net_flow']
-model, processed_data = train_isolation_forest(transactions_df, features, contamination=0.01)
+# 4. Calcular métricas locais (features)
+print("Calculando métricas locais...")
 
-# Filtrar apenas as transações anômalas
-anomalous_data = processed_data[processed_data['is_anomaly'] == 1]
+def calculate_local_metrics(transactions_df):
+    # Verificar se as colunas necessárias estão presentes
+    required_columns = {'address', 'amount', 'is_anomalous'}
+    if not required_columns.issubset(transactions_df.columns):
+        print(f"As colunas necessárias não estão presentes em transactions_df: {required_columns}")
+        return pd.DataFrame()
 
-# Salvar os scores de anomalia apenas das transações anômalas
-anomalous_data.to_csv(ANOMALY_SCORES_FILE, index=False)
-print(f"Scores de anomalia salvos em {ANOMALY_SCORES_FILE}")
+    # Agrupar por endereço e calcular métricas
+    metrics_df = transactions_df.groupby('address').agg(
+        total_amount=('amount', 'sum'),
+        num_transactions=('amount', 'count'),
+        is_anomalous=('is_anomalous', 'max')
+    ).reset_index()
 
-# 4. Filtrar transações anômalas
-print("\nFiltrando transações anômalas...")
-anomalous_addresses = set(anomalous_data['address'])
+    return metrics_df
 
-def filter_transactions_for_anomalous_addresses(input_file, output_file, anomalous_addresses, chunksize=100000):
-    """
-    Filtra as transações que envolvem endereços anômalos e salva em um novo arquivo CSV.
-    """
-    column_names = ['sender', 'receiver', 'timestamp', 'amount']
-    with open(output_file, 'w') as f_out:
-        for chunk_number, chunk in enumerate(pd.read_csv(input_file, header=None, names=column_names, chunksize=chunksize)):
-            # Filtrar transações que envolvem endereços anômalos
-            filtered_chunk = chunk[
-                (chunk['sender'].isin(anomalous_addresses)) |
-                (chunk['receiver'].isin(anomalous_addresses))
-            ]
-            if not filtered_chunk.empty:
-                filtered_chunk.to_csv(f_out, header=(chunk_number == 0), index=False)
-    print(f"Transações anômalas salvas em {output_file}")
+metrics_df = calculate_local_metrics(transactions_df)
 
-# Executar a filtragem das transações anômalas
-filter_transactions_for_anomalous_addresses(
-    input_file=RAW_FILE,
-    output_file=ANOMALOUS_TRANSACTIONS_FILE,
-    anomalous_addresses=anomalous_addresses,
-    chunksize=100000
-)
+# Verificar se metrics_df está vazio
+if metrics_df.empty:
+    print("O DataFrame metrics_df está vazio. Verifique o cálculo de métricas locais.")
+    sys.exit(1)
 
-# 5. Construir o grafo a partir das transações anômalas
-print("\nConstruindo o grafo a partir das transações anômalas...")
-G_anomalous = build_graph_from_anomalous_transactions(ANOMALOUS_TRANSACTIONS_FILE)
+# 5. Treinar modelo de Isolation Forest e avaliar
+print("\nTreinando modelo de Isolation Forest...")
+features = ['total_amount', 'num_transactions']
 
-# 6. Extrair características do grafo anômalo
-print("Extraindo características do grafo anômalo...")
-anomalous_features_df = extract_graph_features(G_anomalous)
+# Preencher valores nulos com zeros
+metrics_df[features] = metrics_df[features].fillna(0)
 
-# Salvar características do grafo anômalo
-anomalous_features_df.to_csv("results/anomalous_graph_features.csv", index=False)
-print("Características do grafo anômalo salvas em results/anomalous_graph_features.csv")
+model_if, processed_data_if = train_isolation_forest(metrics_df, features, contamination=0.01)
 
-# 7. Visualização do Grafo Anômalo
-print("\nVisualizando o grafo anômalo...")
-graph_image_path = os.path.join(VISUALIZATIONS_DIR, 'anomalous_graph.png')
-visualize_graph(G_anomalous, graph_image_path, num_nodes=100)
+# Avaliar o modelo não supervisionado
+print("\nAvaliação do Isolation Forest:")
+evaluate_model(processed_data_if['is_anomalous'], processed_data_if['is_anomaly'], model_name='Isolation Forest')
 
-# 8. Visualização das Distribuições das Features
-print("\nGerando visualizações das distribuições das features...")
-plot_feature_distributions(anomalous_data, features, label_column='is_anomaly', save_path=VISUALIZATIONS_DIR)
+# 6. Treinar modelo supervisionado (Random Forest)
+print("\nTreinando modelo supervisionado (Random Forest)...")
 
-# 9. Explicação do modelo com SHAP
-print("Explicando o modelo com SHAP...")
-explain_model_with_shap(model, anomalous_data, features)
+from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import SMOTE
+
+X = metrics_df[features]
+y = metrics_df['is_anomalous']
+
+# Lidar com desbalanceamento usando SMOTE
+smote = SMOTE(random_state=42)
+X_resampled, y_resampled = smote.fit_resample(X, y)
+
+# Dividir os dados em treino e teste
+X_train, X_test, y_train, y_test = train_test_split(X_resampled, y_resampled, test_size=0.2, random_state=42)
+
+# Treinar o modelo Random Forest
+model_rf = train_random_forest(X_train, y_train)
+
+# Prever e avaliar
+y_pred_rf = model_rf.predict(X_test)
+
+print("\nAvaliação do Random Forest:")
+evaluate_model(y_test, y_pred_rf, model_name='Random Forest')
+
+# 7. Gerar gráficos solicitados
+print("\nGerando gráficos solicitados...")
+
+# Usaremos uma amostra das transações para os gráficos
+sample_size = 1000000
+if len(transactions_df) > sample_size:
+    transactions_sample = transactions_df.sample(n=sample_size, random_state=42)
+else:
+    transactions_sample = transactions_df
+
+# Gerar gráficos (ajuste as funções de visualização conforme necessário)
+# ...
 
 print("\nPipeline concluído!")
